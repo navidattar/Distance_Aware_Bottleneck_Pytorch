@@ -18,7 +18,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..layers import DABOutput, NormalFullCovarianceDAB
+from ..factory import build_bottleneck
+from ..layers import DABOutput
 
 
 class BasicBlock(nn.Module):
@@ -70,9 +71,14 @@ class WideResNetDAB(nn.Module):
         ``(depth - 4) % 6 == 0``.
       width_multiplier: "k" in WRN-n-k.
       num_classes: number of output classes.
-      dab_dim: bottleneck dimension.
-      codebook_size: number of centroids.
+      dab_dim: bottleneck dimension. Ignored for ``bottleneck="fsq"`` when
+        ``levels`` is a list (the dimension is then ``len(levels)``).
+      codebook_size: number of centroids. Ignored for ``bottleneck="fsq"``.
       dab_tau: temperature of the distances from the codebook.
+      bottleneck: which codebook to use -- ``"full"`` (the reference CIFAR-10
+        setting), ``"diag"``, or ``"fsq"`` for the Finite Scalar Quantization
+        product grid. See :func:`dab.build_bottleneck`.
+      levels: ``bottleneck="fsq"`` only -- values per coordinate.
       version: residual-block ordering (see :class:`BasicBlock`).
       in_channels: number of input image channels.
       dab_kwargs: extra keyword arguments forwarded to the DAB layer.
@@ -87,6 +93,7 @@ class WideResNetDAB(nn.Module):
     def __init__(self, depth: int = 28, width_multiplier: int = 10,
                  num_classes: int = 10, dab_dim: int = 8,
                  codebook_size: int = 10, dab_tau: float = 1.0,
+                 bottleneck: str = "full", levels=None,
                  version: int = 2, in_channels: int = 3,
                  generator: Optional[torch.Generator] = None, **dab_kwargs):
         super().__init__()
@@ -114,11 +121,11 @@ class WideResNetDAB(nn.Module):
 
         # The reference model passes HeNormal to the DAB dense layer.
         dab_kwargs.setdefault("kernel_initializer", "he_normal")
-        self.dab = NormalFullCovarianceDAB(
-            in_features=self.feature_dim, dab_dim=dab_dim,
-            codebook_size=codebook_size, dab_tau=dab_tau,
+        self.dab = build_bottleneck(
+            bottleneck, in_features=self.feature_dim, dab_dim=dab_dim,
+            codebook_size=codebook_size, levels=levels, dab_tau=dab_tau,
             generator=generator, **dab_kwargs)
-        self.decoder = nn.Linear(dab_dim, num_classes)
+        self.decoder = nn.Linear(self.dab.dab_dim, num_classes)
         nn.init.kaiming_normal_(self.decoder.weight, mode="fan_in",
                                 nonlinearity="relu")
         nn.init.zeros_(self.decoder.bias)
@@ -155,12 +162,13 @@ class WideResNetDAB(nn.Module):
 def wide_resnet_dab(depth: int = 28, width_multiplier: int = 10,
                     num_classes: int = 10, dab_dim: int = 8,
                     codebook_size: int = 10, dab_tau: float = 1.0,
-                    version: int = 2, **kwargs) -> WideResNetDAB:
+                    bottleneck: str = "full", version: int = 2,
+                    **kwargs) -> WideResNetDAB:
     """Functional alias mirroring the reference ``wide_resnet_dab(...)``."""
     return WideResNetDAB(depth=depth, width_multiplier=width_multiplier,
                          num_classes=num_classes, dab_dim=dab_dim,
                          codebook_size=codebook_size, dab_tau=dab_tau,
-                         version=version, **kwargs)
+                         bottleneck=bottleneck, version=version, **kwargs)
 
 
 __all__ = ["WideResNetDAB", "wide_resnet_dab", "BasicBlock"]

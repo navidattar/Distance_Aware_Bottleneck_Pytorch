@@ -20,6 +20,15 @@ The port is line-by-line auditable against the original: attribute names, buffer
 semantics, update equations and the two-phase training schedule all match. Every
 deviation is listed in [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md).
 
+**Two codebooks, one interface.** Alongside the paper's explicit Gaussian
+centroids, the package ships an optional **Finite Scalar Quantization** codebook
+([Mentzer et al., ICLR 2024](https://arxiv.org/abs/2309.15505)): the codes become
+the Cartesian product of per-coordinate scalar levels, which costs *zero*
+codebook parameters, cannot collapse, and hands you discrete tokens for free.
+Switching is one word — `bottleneck="fsq"` — and everything else (the objective,
+the E-step, the RDFC schedule, the training loop) is unchanged. See
+[Choosing a codebook](#choosing-a-codebook).
+
 ---
 
 ## Contents
@@ -27,6 +36,8 @@ deviation is listed in [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md).
 - [Install](#install)
 - [30-second example](#30-second-example)
 - [How DAB works](#how-dab-works)
+- [Choosing a codebook](#choosing-a-codebook)
+- [The FSQ codebook](#the-fsq-codebook)
 - [Adding DAB to your own model](#adding-dab-to-your-own-model)
 - [The training loop](#the-training-loop)
 - [API reference](#api-reference)
@@ -75,6 +86,20 @@ out.distance    # [32]     per-example uncertainty (higher = more novel)
 That is the whole inference story: one forward pass, one extra scalar per
 example. Training needs the two-phase loop described below — without it the
 codebook never moves and the distance is meaningless.
+
+The same thing with an FSQ codebook instead — no codebook parameters, plus a
+discrete token per example:
+
+```python
+from dab import FSQDAB, recommended_levels
+
+layer = FSQDAB(in_features=640, levels=recommended_levels(1024))  # [8, 5, 5, 5]
+
+out = layer(features)
+out.latent      # [32, 4]   d is len(levels)
+out.distance    # [32]      same uncertainty score
+out.indices     # [32]      code index in [0, 1000)
+```
 
 ---
 
@@ -126,6 +151,162 @@ distance is large.
 centroid means are updated by gradient descent on the mean distance, and the
 covariances and priors are recomputed in closed form (Davis & Dhillon's optimal
 Gaussian codebook, with a Dirichlet(5) smoothing of the responsibilities).
+
+---
+
+## Choosing a codebook
+
+Both codebooks implement the same DAB objective, the same E-step, and the same
+two-phase schedule. They differ only in *what the codes are*.
+
+|                          | `"full"` / `"diag"` (reference DAB) | `"fsq"` (FSQ grid) |
+| --- | --- | --- |
+| codes | `K` learned Gaussians in `R^d` | `∏ⱼ Lⱼ` implicit product codes |
+| codebook parameters | `K × d` means (+ covariance state) | **none** — the grid is fixed |
+| distance cost / example | `O(K·d²)` full, `O(K·d)` diag | `O(Σⱼ Lⱼ)` |
+| codebook collapse | possible (centroids can die) | impossible by construction |
+| discrete tokens | ✗ | ✓ `out.indices` |
+| far-OOD distance | grows without bound | **saturates** (see the warning below) |
+| faithful to the DAB paper | ✓ | extension |
+
+**Use the reference codebook when** you want to reproduce the paper, or when
+ranking far-out-of-distribution inputs is the point. It is the default.
+
+**Use FSQ when** you want a large codebook cheaply (`[8,5,5,5]` is 1000 codes for
+zero parameters), when you need discrete tokens downstream (a transformer over
+the latent, retrieval, caching), or when you saw dead centroids with a large `K`.
+
+```python
+from dab import build_bottleneck, recommended_levels
+
+build_bottleneck("full", in_features=640, dab_dim=8, codebook_size=10)
+build_bottleneck("fsq",  in_features=640, levels=recommended_levels(1024))
+```
+
+Every model takes the same switch:
+
+```python
+from dab.models import wide_resnet_dab
+
+wide_resnet_dab(bottleneck="full", dab_dim=8, codebook_size=10)      # default
+wide_resnet_dab(bottleneck="fsq",  levels=[8, 5, 5, 5])
+```
+
+---
+
+## The FSQ codebook
+
+FSQ bounds each latent coordinate with a `tanh`-based function and rounds to
+integers, so coordinate `j` takes one of `Lⱼ` values. The codebook is the
+Cartesian product of those value sets — `|C| = ∏ⱼ Lⱼ` codewords exist, but none
+are stored or learned.
+
+`FSQDAB` keeps that grid and makes each product code a **Gaussian**: coordinate
+`j`, level `l` carries `N(gⱼₗ, s²ⱼₗ)` where `gⱼₗ` is the fixed grid point and the
+variance is fitted by the same closed-form M-step the reference DAB uses. That
+is what keeps it DAB rather than plain FSQ — the distance is still a KL
+divergence between distributions, not a Euclidean distance between points.
+
+### Why the per-coordinate computation is exact
+
+The encoder covariance is diagonal and the prior factorises over coordinates, so
+for a product code `c = (l₁,…,l_d)` with `π_c = ∏ⱼ πⱼ,ₗⱼ`:
+
+- `KL(encoder ‖ code_c) = Σⱼ KLⱼ(lⱼ)` — the KL is additive;
+- the Gibbs assignment `a_c ∝ π_c exp(−τ·KL_c)` therefore **factorises** into
+  `a_c = ∏ⱼ aⱼ,ₗⱼ`;
+- and the expected distortion `Σ_c a_c KL_c` collapses to `Σⱼ Σₗ aⱼₗ KLⱼ(l)`.
+
+So the coordinate-wise distance is *identical* to the expected KL over all
+`∏ⱼ Lⱼ` product codes, at `O(Σⱼ Lⱼ)` cost instead of `O(∏ⱼ Lⱼ)`. This is checked
+against brute-force enumeration in `tests/test_fsq_dab.py`, for several level
+sets and temperatures.
+
+### Soft and hard modes
+
+```python
+FSQDAB(in_features=640, levels=[8, 5, 5, 5], hard=False)   # default
+```
+
+- **`hard=False` (soft, default)** — DAB semantics. The assignment is the Gibbs
+  posterior over levels, the distortion is the expected KL, and the head sees a
+  continuous latent. `out.indices` is still reported (the nearest code), so you
+  get tokens without giving up the soft objective.
+- **`hard=True`** — FSQ semantics. The mean is rounded with a straight-through
+  estimator, the head sees the **quantized codeword**, and the distortion is the
+  KL to that single selected code. Use this when the latent must genuinely be
+  discrete; `out.latent` is then exactly `fsq.indices_to_codes(out.indices)`.
+
+### Code variances
+
+```python
+FSQDAB(..., code_scale_mode="ema")       # default
+```
+
+| mode | behaviour | codebook parameters |
+| --- | --- | --- |
+| `"ema"` | fitted by DAB's closed-form M-step | 0 |
+| `"fixed"` | frozen at `code_scale_init` (purest FSQ — nothing is learned) | 0 |
+| `"learned"` | a trainable parameter, updated in the RDFC phase | `Σⱼ Lⱼ` |
+
+With `"ema"` or `"fixed"` the codebook has **no trainable parameters at all**, so
+`build_optimizers` returns `codebook_optimizer=None`. `rdfc_epoch` accepts that
+and still runs both M-step sub-passes — fitting the variances and priors is what
+adapts an FSQ codebook to your data.
+
+### Choosing levels
+
+The FSQ paper's heuristic is `Lⱼ ≥ 5` for every coordinate, with `d < 10`.
+`recommended_levels(size)` returns the paper's Table 1 entries:
+
+| target `\|C\|` | levels |
+| --- | --- |
+| 2⁸ = 256 | `[8, 6, 5]` |
+| 2¹⁰ = 1024 | `[8, 5, 5, 5]` |
+| 2¹² = 4096 | `[7, 5, 5, 5, 5]` |
+| 2¹⁴ | `[8, 8, 8, 6, 5]` |
+| 2¹⁶ | `[8, 8, 8, 5, 5, 5]` |
+
+Note that `d = len(levels)`, so the level set also fixes the bottleneck
+dimension. Ragged sets like `[8, 6, 5]` are fully supported.
+
+### Saturation: read this before using FSQ for OOD
+
+FSQ bounds the encoder mean with a `tanh`. An input far outside the training
+manifold lands on the **edge** of the grid and stops moving, so its codebook
+distance stops growing: a wildly-OOD input can score the same as a mildly-OOD
+one. The encoder *variance* is unbounded and still responds, which is why the
+score does not collapse entirely — but the ranking degrades in the far tail.
+
+Mitigations, in order of preference:
+
+1. **Use the reference codebook** (`bottleneck="full"`) if far-OOD ranking is the
+   primary goal. This is why it stays the default.
+2. **`bound=None`** — drops the `tanh` and puts the grid on an unbounded integer
+   lattice, so the distance grows without limit. You keep the DAB uncertainty
+   and lose FSQ's guarantee of a finite token set (indices are clamped to the
+   grid and are no longer a faithful encoding).
+3. **Watch `out.diagnostics["saturated_frac"]`** — the fraction of coordinates
+   pinned to an outermost level. If it is high on your in-distribution data the
+   grid is too small or the encoder is over-driven, and the score is degraded for
+   everything, not just the tail.
+
+### Plain FSQ, without DAB
+
+`dab.FSQ` is a standalone, faithful port of the reference JAX quantizer, usable
+in any VQ-VAE-style model:
+
+```python
+from dab import FSQ
+
+fsq = FSQ([8, 5, 5, 5])
+zhat, indices = fsq(z)            # z: [B, 4] -> zhat [B, 4], indices [B]
+fsq.codebook_size                 # 1000
+fsq.indices_to_codes(indices)     # == zhat
+```
+
+It has no parameters, no commitment loss and no EMA — that is the point of the
+paper.
 
 ---
 
@@ -275,6 +456,56 @@ NormalFullCovarianceDAB(
 
 `forward(inputs, training=None) -> DABOutput`.
 
+### `FSQDAB`
+
+```python
+FSQDAB(
+    in_features,            # size of the incoming feature vector
+    levels=5,               # [L_1, ..., L_d], or an int with dab_dim
+    dab_dim=None,           # only needed when levels is an int
+    dab_tau=1.0,
+    momentum=0.99,
+    hard=False,             # False: soft Gibbs assignment; True: FSQ round + STE
+    bound="fsq",            # the paper's bounding function, or None for a lattice
+    code_scale_mode="ema",  # "ema" | "fixed" | "learned"
+    code_scale_init=None,   # default: half the grid spacing of each coordinate
+    fsq_eps=1e-3,
+    activation="relu", use_bias=False,
+    kernel_initializer="glorot_uniform",
+    var_shift=5.0, var_floor=1e-5, generator=None,
+)
+```
+
+`forward(inputs, training=None) -> DABOutput`. Extra attributes:
+`codebook_size` (`∏ⱼ Lⱼ`), `num_codebook_parameters`, `levels`, and `fsq` (the
+underlying `FSQ` quantizer).
+
+### `FSQ`
+
+```python
+FSQ(levels, eps=1e-3)
+```
+
+| Member | Purpose |
+| --- | --- |
+| `bound(z)` | the paper's `f`: `tanh(z + shift) * half_l − offset` |
+| `quantize(z)` | `round_ste(bound(z))`, renormalised to `[-1, 1]` |
+| `forward(z)` | `(zhat, indices)` |
+| `codes_to_indices` / `indices_to_codes` | bijection with `[0, ∏ⱼ Lⱼ)` |
+| `per_channel_indices(zhat)` | per-coordinate level index |
+| `codebook` | the full codebook, materialised on demand for inspection |
+| `codebook_size`, `num_dimensions`, `channel_codes()` | grid properties |
+
+### `build_bottleneck`
+
+```python
+build_bottleneck(kind, in_features, dab_dim=None, codebook_size=None,
+                 levels=None, **kwargs) -> DABLayer
+```
+
+`kind` is `"full"`, `"diag"` or `"fsq"`. Use it when the codebook should be a
+config option rather than an import.
+
 ### `DABOutput`
 
 | Field | Shape | Meaning |
@@ -284,8 +515,12 @@ NormalFullCovarianceDAB(
 | `mean` | `[B, d]` | encoder mean `μ(x)` |
 | `variance` | `[B, d]` | encoder variances (diagonal of `Σ(x)` for the full-cov layer) |
 | `covariance` | `[B, d, d]` | encoder covariance (full-cov layer only) |
-| `distances_from_centroids` | `[B, K]` | per-centroid `KL(encoder ‖ centroid)` |
-| `assignment` | `[B, K]` | E-step responsibilities (always detached) |
+| `distances_from_centroids` | `[B, K]` | per-centroid `KL(encoder ‖ centroid)`; `[B, d, L]` for FSQ |
+| `assignment` | `[B, K]` | E-step responsibilities, same shape (always detached) |
+| `indices` | `[B]` | **FSQ only** — code index in `[0, ∏ⱼ Lⱼ)` |
+| `per_coord_indices` | `[B, d]` | **FSQ only** — level index per coordinate |
+| `pre_bound_mean` | `[B, d]` | **FSQ only** — the mean before the bounding function |
+| `diagnostics` | dict | level occupancy, perplexity, `unused_level_frac`, `saturated_frac` |
 
 `out.as_tensor()` returns `concat([latent, distance[:, None]], -1)` — the exact
 tensor the reference Keras layer emits, if you are porting downstream code.
@@ -296,6 +531,11 @@ tensor the reference Keras layer emits, if you are porting downstream code.
 `centroid_covariance`, `centroid_covariance_mavg`, `initialized`, and for the
 full-covariance layer `centroid_precision`,
 `centroid_covariance_log_abs_det`.
+
+`FSQDAB` uses the same names, shaped `[d, L]` instead of `[K]` / `[K, d]`, with
+`centroid_means` a **buffer** (the fixed grid) rather than a parameter, plus
+`level_mask` and `grid_spacing`. Because the names match, `codebook_parameters`,
+`rdfc_epoch` and the checkpointing story are identical for both codebooks.
 
 ### Functions
 
@@ -309,6 +549,9 @@ full-covariance layer `centroid_precision`,
 | `find_dab_layers(model)` | every DAB layer in a module tree |
 | `WarmUpPiecewiseConstantSchedule(optimizer, ...)` | the reference LR schedule (step it per optimiser step) |
 | `kl_normal_diag`, `kl_normal_full`, `fill_triangular` | the underlying tensor primitives |
+| `build_bottleneck(kind, ...)` | build any codebook by name |
+| `recommended_levels(size)` | the FSQ paper's Table 1 level sets |
+| `round_ste(z)` | rounding with straight-through gradients |
 
 ---
 
@@ -346,6 +589,13 @@ Practical guidance:
 - **Diagonal vs full covariance:** full is more expressive and costs
   `O(B·K·d²)` per forward plus a `d×d` SVD per example; diagonal is
   `O(B·K·d)`. Use full for small `d`, diagonal for large `K`.
+
+For the FSQ codebook, `codebook_size` and `dab_dim` are both replaced by
+`levels`: `d = len(levels)` and `|C| = ∏ⱼ Lⱼ`. Start from
+`recommended_levels(K)` for whatever `K` you would have used, keep `Lⱼ ≥ 5`, and
+tune `beta` and `dab_tau` exactly as above — `dab_tau` now sharpens the
+assignment *within each coordinate*, so a value that worked for `K` explicit
+codes is a reasonable starting point.
 
 ---
 
@@ -388,6 +638,10 @@ model = wide_resnet_dab(depth=28, width_multiplier=10, num_classes=10,
                         dab_dim=8, codebook_size=10, dab_tau=1.0)
 logits, out = model(images)
 
+# ... or the same backbone with an FSQ codebook
+model = wide_resnet_dab(depth=28, width_multiplier=10, num_classes=10,
+                        bottleneck="fsq", levels=[8, 5, 5, 5], dab_tau=1.0)
+
 # ImageNet model: frozen pretrained ResNet-50 + MLP head + diagonal DAB
 model = pretrained_resnet50_dab(num_classes=1000, dab_dim=4,
                                 codebook_size=1000, dab_tau=2.0,
@@ -409,6 +663,9 @@ python examples/train_cifar10.py --data_root ./data
 
 # quick sanity run
 python examples/train_cifar10.py --epochs 5 --depth 16 --width_multiplier 4
+
+# the same, with an FSQ codebook
+python examples/train_cifar10.py --bottleneck fsq --levels 8 5 5 5
 ```
 
 ---
@@ -465,6 +722,18 @@ Expected. The codebook covariance starts at the identity while encoder scales
 start near `1e-2`, so the initial KL is dominated by the log-determinant ratio.
 It drops sharply after the first RDFC phase.
 
+**FSQ: `saturated_frac` is high, or OOD AUROC is good for near-OOD and poor for
+far-OOD.**
+The `tanh` bound has saturated — see
+[the saturation warning](#saturation-read-this-before-using-fsq-for-ood).
+Try `bound=None`, more levels, or the reference codebook.
+
+**FSQ: `build_optimizers` returned `codebook_optimizer=None`.**
+Expected. The grid is fixed and the variances are fitted in closed form, so
+there is nothing to descend on. `rdfc_epoch(model, None, ...)` still runs both
+M-step sub-passes. Pass `code_scale_mode="learned"` if you want a trainable
+codebook parameter.
+
 **NaNs in the full-covariance layer.**
 The encoder's SVD backward is unstable when singular values coincide, which the
 reference implementation shares. Try the diagonal layer, a smaller `dab_dim`, or
@@ -479,13 +748,26 @@ pip install pytest
 pytest tests/ -q
 ```
 
-71 tests covering: `fill_triangular` against the tfp docstring values, both KL
+135 tests.
+
+*DAB core:* `fill_triangular` against the tfp docstring values, both KL
 divergences against `torch.distributions`, the encoder parameterisation, the
 E-step formula and its stop-gradient, uniform assignment before initialisation,
 both closed-form covariance updates against explicit loops, the moving-average
 formulas, the RDFC phase ordering (including that the priors are estimated with
 the committed covariance), the parameter split, full-covariance sampling against
 its empirical covariance, `state_dict` round-trips, and the LR schedule.
+
+*FSQ:* every channel taking exactly `L` values for extreme inputs, the
+renormalised grid, the even-`L` asymmetry, `f(0)` landing mid-grid, index
+round-trips, codebook enumeration against `itertools.product`, STE gradients,
+Table 1, and codebook utilisation above 90%.
+
+*FSQ-DAB:* the factorization identity against brute-force enumeration over the
+full product codebook (several level sets × temperatures), assignment
+factorisation, ragged-level masking, hard-mode one-hot assignment and codeword
+latents, the closed-form variance M-step, RDFC without a codebook optimiser, and
+the saturation diagnostic.
 
 ---
 
@@ -501,7 +783,25 @@ its empirical covariance, `state_dict` round-trips, and the LR schedule.
 }
 ```
 
+If you use the FSQ codebook, please also cite:
+
+```bibtex
+@inproceedings{mentzer2024finite,
+  title     = {Finite Scalar Quantization: {VQ-VAE} Made Simple},
+  author    = {Mentzer, Fabian and Minnen, David and Agustsson, Eirikur and
+               Tschannen, Michael},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+```
+
 Apache License 2.0, matching the original repository. The original TensorFlow
 implementation is © 2024 Ifigeneia Apostolopoulou; this port keeps that notice
-in every ported file. The WideResNet backbone follows
+in every ported file. `dab/fsq.py` is a port of the JAX implementation in
+[google-research/fsq](https://github.com/google-research/google-research/tree/master/fsq),
+© 2023 The Google Research Authors. The WideResNet backbone follows
 [Uncertainty Baselines](https://github.com/google/uncertainty-baselines/).
+
+`FSQDAB` — DAB's objective over an FSQ grid — is an engineering extension, not
+something either paper proposes; it is documented as such in
+[`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) §6 and is never the default.

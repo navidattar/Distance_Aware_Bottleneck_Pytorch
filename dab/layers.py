@@ -27,8 +27,8 @@ mirror the TensorFlow source so the two can be diffed side by side.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Optional, Union
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -67,7 +67,13 @@ class DABOutput:
                    diagonal of the full covariance (full layer).
       covariance:  ``[B, dab_dim, dab_dim]`` encoder covariance (full layer only).
       distances_from_centroids: ``[B, K]`` per-centroid ``KL(encoder || centroid)``.
-      assignment:  ``[B, K]`` soft E-step responsibilities (always detached).
+        For the FSQ codebook this is ``[B, d, L]`` -- per coordinate, per level.
+      assignment:  soft E-step responsibilities, same shape (always detached).
+      indices:     ``[B]`` integer code index into the implicit FSQ codebook, and
+                   ``[B, d]`` per-coordinate levels in ``per_coord_indices``
+                   (FSQ codebook only).
+      pre_bound_mean: ``[B, d]`` encoder mean before the FSQ bounding function
+                   (FSQ codebook only) -- useful for detecting saturation.
     """
 
     latent: torch.Tensor
@@ -77,6 +83,10 @@ class DABOutput:
     distances_from_centroids: torch.Tensor
     assignment: torch.Tensor
     covariance: Optional[torch.Tensor] = None
+    indices: Optional[torch.Tensor] = None
+    per_coord_indices: Optional[torch.Tensor] = None
+    pre_bound_mean: Optional[torch.Tensor] = None
+    diagnostics: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     def as_tensor(self) -> torch.Tensor:
         """``concat([latent, distance[:, None]], -1)`` -- the TF layer output."""
@@ -88,39 +98,39 @@ class DABOutput:
         return self.distance
 
 
-class _NormalDAB(nn.Module):
-    """Abstract dense layer with a Distance-Aware Bottleneck.
+class DABLayer(nn.Module):
+    """Machinery shared by every Distance-Aware Bottleneck layer.
 
-    Normal distributions are used for both the encoder and the codebook entries.
-    Subclasses implement :meth:`forward`, :meth:`set_codebook_covariance` and
-    :meth:`_calculate_codebook_covariance`.
+    Owns the Gaussian encoder (activation + dense projection), the
+    ``initialized`` flag, the prior moving averages, and the RDFC protocol that
+    :func:`dab.trainer.rdfc_epoch` drives. Subclasses own the codebook itself:
+
+    * :class:`_NormalDAB` -- ``K`` explicit multivariate Gaussian centroids
+      (the reference DAB codebook);
+    * :class:`~dab.fsq_dab.FSQDAB` -- a per-coordinate finite scalar grid whose
+      Cartesian product is the codebook (the FSQ codebook).
+
+    Subclasses must implement ``forward``, ``set_codebook_covariance`` and
+    ``_calculate_codebook_covariance``, and must register ``centroid_probs``,
+    ``centroid_probs_mavg`` and ``centroid_covariance_mavg`` buffers.
 
     Args:
       in_features: size of the incoming feature vector.
       units: number of encoder outputs (means + covariance parameters).
       dab_dim: dimension ``d`` of the latent features.
-      codebook_size: number of centroids ``K``.
       dab_tau: temperature multiplying the distance in the E-step softmax.
       momentum: momentum of the moving averages used to accumulate the codebook
         covariances and prior probabilities in a batched manner. Use ``0.0`` to
-        take the current batch's estimate outright (the synthetic-regression
-        demo of the reference code does exactly that).
+        take each batch's estimate outright.
       activation: non-linearity applied to the incoming features *before* the
-        encoder's linear layer. ``"relu"`` in the reference layer, ``None`` in
-        the synthetic demo.
+        encoder's linear layer. ``"relu"`` in the reference layer, ``None`` when
+        the preceding layer is already activated.
       use_bias: whether the encoder's linear layer has a bias.
-      kernel_initializer: ``"glorot_uniform"`` (the Keras ``Dense`` default and
-        therefore the layer default) or ``"he_normal"`` (what the reference
-        WideResNet/ResNet-50 models pass in).
+      kernel_initializer: ``"glorot_uniform"`` (the Keras ``Dense`` default) or
+        ``"he_normal"`` (what the reference image models pass in).
       var_shift, var_floor: encoder scale parameterisation,
-        ``scale = softplus(raw - var_shift) + var_floor``. The shift keeps the
-        singular values small early on and eases convergence (5.0 and 1e-5 in
-        the reference code).
+        ``scale = softplus(raw - var_shift) + var_floor``.
       generator: optional ``torch.Generator`` for reproducible initialisation.
-
-    Shape:
-      input ``[B, in_features]`` -> :class:`DABOutput` whose ``as_tensor()`` is
-      ``[B, dab_dim + 1]``.
     """
 
     def __init__(
@@ -128,7 +138,6 @@ class _NormalDAB(nn.Module):
         in_features: int,
         units: int,
         dab_dim: int,
-        codebook_size: int,
         dab_tau: float = 1.0,
         momentum: float = 0.99,
         activation: Union[str, Callable, None] = "relu",
@@ -142,7 +151,6 @@ class _NormalDAB(nn.Module):
         self.in_features = in_features
         self.units = units
         self.dab_dim = dab_dim
-        self.codebook_size = codebook_size
         self.dab_tau = dab_tau
         self.momentum = momentum
         self.var_shift = var_shift
@@ -156,28 +164,11 @@ class _NormalDAB(nn.Module):
             raise ValueError(f"unknown activation {activation!r}")
         self._activation_name = activation if not callable(activation) else "custom"
 
-        # Encoder: a plain dense layer producing the Gaussian parameters.
         self.dense = nn.Linear(in_features, units, bias=use_bias)
         self._init_kernel(kernel_initializer, generator)
 
-        # Centroid means -- the only *trainable* codebook parameter. The name
-        # contains "centroid" so that the RDFC parameter split works (see
-        # ``dab.trainer.codebook_parameters``), matching the reference code's
-        # ``if "centroid" in var.name`` filter.
-        means = torch.empty(codebook_size, dab_dim)
-        with torch.no_grad():
-            means.normal_(mean=0.0, std=0.1, generator=generator)
-        self.centroid_means = nn.Parameter(means)
-
-        # Prior centroid probabilities, two copies:
-        #  * ``centroid_probs``      -- committed, used by the E-step this epoch;
-        #  * ``centroid_probs_mavg`` -- moving average accumulated for the next.
-        uniform = torch.full((codebook_size,), 1.0 / codebook_size)
-        self.register_buffer("centroid_probs", uniform.clone())
-        self.register_buffer("centroid_probs_mavg", uniform.clone())
-
         # False until the first RDFC phase completes; while False, datapoints are
-        # assigned to centroids uniformly at random.
+        # assigned to codes uniformly at random.
         self.register_buffer("initialized", torch.zeros((), dtype=torch.bool))
 
     # ------------------------------------------------------------------ #
@@ -208,32 +199,15 @@ class _NormalDAB(nn.Module):
     def forward(self, inputs: torch.Tensor,
                 training: Optional[bool] = None) -> DABOutput:
         raise NotImplementedError(
-            f"Normal DAB '{type(self).__name__}' must override `forward(...)`.")
+            f"DAB layer '{type(self).__name__}' must override `forward(...)`.")
 
     # ------------------------------------------------------------------ #
-    #  E-step shared by both covariance variants
+    #  Utility functions for the code prior probabilities
     # ------------------------------------------------------------------ #
-    def _e_step(self, distances_from_centroids: torch.Tensor) -> torch.Tensor:
-        """Conditional assignment probabilities ``p(h | x_i)``.
+    def _uniform_prior(self, like: torch.Tensor) -> torch.Tensor:
+        """The uniform prior over codes, shaped and placed like ``like``."""
+        raise NotImplementedError
 
-        ``softmax(log pi - tau * KL)`` over the codebook axis, always detached:
-        the responsibilities are treated as constants by the network's
-        optimiser, exactly as ``tf.stop_gradient`` does in the reference code.
-        Before the first RDFC phase (``initialized == False``) the assignment is
-        uniform.
-        """
-        if not bool(self.initialized):
-            return torch.full_like(distances_from_centroids,
-                                   1.0 / self.codebook_size)
-        log_centroid_probs = torch.log(self.centroid_probs).reshape(
-            1, self.codebook_size)
-        logits = (log_centroid_probs
-                  - self.dab_tau * distances_from_centroids).detach()
-        return torch.softmax(logits, dim=-1)
-
-    # ------------------------------------------------------------------ #
-    #  Utility functions for the centroid probabilities
-    # ------------------------------------------------------------------ #
     @torch.no_grad()
     def _update_centroid_probs(self, training: bool,
                                cond_centroid_probs: torch.Tensor) -> None:
@@ -250,7 +224,8 @@ class _NormalDAB(nn.Module):
 
         Called at the start of the prior sub-phase of the RDFC M-step.
         """
-        self.centroid_probs_mavg.fill_(1.0 / self.codebook_size)
+        self.centroid_probs_mavg.copy_(
+            self._uniform_prior(self.centroid_probs_mavg))
 
     @torch.no_grad()
     def set_centroid_probs(self) -> None:
@@ -290,7 +265,7 @@ class _NormalDAB(nn.Module):
 
     def set_codebook_covariance(self) -> None:
         raise NotImplementedError(
-            f"Normal DAB '{type(self).__name__}' must override "
+            f"DAB layer '{type(self).__name__}' must override "
             "`set_codebook_covariance(...)`.")
 
     @torch.no_grad()
@@ -310,7 +285,7 @@ class _NormalDAB(nn.Module):
     def _calculate_codebook_covariance(self, cond_centroid_probs, mu,
                                        covariance):
         raise NotImplementedError(
-            f"Normal DAB '{type(self).__name__}' must override "
+            f"DAB layer '{type(self).__name__}' must override "
             "`_calculate_codebook_covariance(...)`.")
 
     @torch.no_grad()
@@ -318,7 +293,7 @@ class _NormalDAB(nn.Module):
                            n: torch.Tensor) -> torch.Tensor:
         r"""Per-datapoint contribution weights for the codebook covariance.
 
-        ``(a_ik + 5) / (sum_i a_ik + 5 N)``: a Dirichlet prior with
+        ``(a_ik + 5) / (sum_i a_ik + 5N)``: a Dirichlet prior with
         :math:`a_k = 5` that avoids over-concentration and eases training.
         """
         return (cond_centroid_probs + 5.0) / (
@@ -339,6 +314,92 @@ class _NormalDAB(nn.Module):
         """``set_codebook_covariance()`` + ``set_centroid_probs()``."""
         self.set_codebook_covariance()
         self.set_centroid_probs()
+
+    def extra_repr(self) -> str:
+        return (f"in_features={self.in_features}, dab_dim={self.dab_dim}, "
+                f"dab_tau={self.dab_tau}, momentum={self.momentum}, "
+                f"activation={self._activation_name}")
+
+
+class _NormalDAB(DABLayer):
+    """Abstract dense layer with the reference DAB codebook.
+
+    Normal distributions are used for both the encoder and the ``K`` codebook
+    entries. Subclasses implement :meth:`forward`,
+    :meth:`set_codebook_covariance` and :meth:`_calculate_codebook_covariance`.
+
+    In addition to :class:`DABLayer`'s arguments:
+
+    Args:
+      codebook_size: number of centroids ``K``.
+
+    Shape:
+      input ``[B, in_features]`` -> :class:`DABOutput` whose ``as_tensor()`` is
+      ``[B, dab_dim + 1]``.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        units: int,
+        dab_dim: int,
+        codebook_size: int,
+        dab_tau: float = 1.0,
+        momentum: float = 0.99,
+        activation: Union[str, Callable, None] = "relu",
+        use_bias: bool = False,
+        kernel_initializer: str = "glorot_uniform",
+        var_shift: float = 5.0,
+        var_floor: float = 1e-5,
+        generator: Optional[torch.Generator] = None,
+    ):
+        super().__init__(in_features=in_features, units=units, dab_dim=dab_dim,
+                         dab_tau=dab_tau, momentum=momentum,
+                         activation=activation, use_bias=use_bias,
+                         kernel_initializer=kernel_initializer,
+                         var_shift=var_shift, var_floor=var_floor,
+                         generator=generator)
+        self.codebook_size = codebook_size
+
+        # Centroid means -- the only *trainable* codebook parameter. The name
+        # contains "centroid" so that the RDFC parameter split works (see
+        # ``dab.trainer.codebook_parameters``), matching the reference code's
+        # ``if "centroid" in var.name`` filter.
+        means = torch.empty(codebook_size, dab_dim)
+        with torch.no_grad():
+            means.normal_(mean=0.0, std=0.1, generator=generator)
+        self.centroid_means = nn.Parameter(means)
+
+        # Prior centroid probabilities, two copies:
+        #  * ``centroid_probs``      -- committed, used by the E-step this epoch;
+        #  * ``centroid_probs_mavg`` -- moving average accumulated for the next.
+        uniform = torch.full((codebook_size,), 1.0 / codebook_size)
+        self.register_buffer("centroid_probs", uniform.clone())
+        self.register_buffer("centroid_probs_mavg", uniform.clone())
+
+    def _uniform_prior(self, like: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(like, 1.0 / self.codebook_size)
+
+    # ------------------------------------------------------------------ #
+    #  E-step shared by both covariance variants
+    # ------------------------------------------------------------------ #
+    def _e_step(self, distances_from_centroids: torch.Tensor) -> torch.Tensor:
+        """Conditional assignment probabilities ``p(h | x_i)``.
+
+        ``softmax(log pi - tau * KL)`` over the codebook axis, always detached:
+        the responsibilities are treated as constants by the network's
+        optimiser, exactly as ``tf.stop_gradient`` does in the reference code.
+        Before the first RDFC phase (``initialized == False``) the assignment is
+        uniform.
+        """
+        if not bool(self.initialized):
+            return torch.full_like(distances_from_centroids,
+                                   1.0 / self.codebook_size)
+        log_centroid_probs = torch.log(self.centroid_probs).reshape(
+            1, self.codebook_size)
+        logits = (log_centroid_probs
+                  - self.dab_tau * distances_from_centroids).detach()
+        return torch.softmax(logits, dim=-1)
 
     def extra_repr(self) -> str:
         return (f"in_features={self.in_features}, dab_dim={self.dab_dim}, "

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dab-pytorch"
 version = "1.0.0"
-description = "Distance-Aware Bottleneck (ICML 2024) - faithful PyTorch implementation"
+description = "Distance-Aware Bottleneck (ICML 2024) - faithful PyTorch implementation, with an optional Finite Scalar Quantization codebook"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
@@ -23,6 +23,7 @@ test = ["pytest"]
 [project.urls]
 Homepage = "https://github.com/navidattar/Distance_Aware_Bottleneck_Pytorch"
 Paper = "https://arxiv.org/abs/2406.10775"
+FSQPaper = "https://arxiv.org/abs/2309.15505"
 Reference = "https://github.com/ifiaposto/Distance_Aware_Bottleneck"
 
 [tool.setuptools.packages.find]

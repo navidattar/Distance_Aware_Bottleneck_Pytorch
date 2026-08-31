@@ -14,6 +14,11 @@ Usage::
 
     python examples/train_cifar10.py --data_root ./data
     python examples/train_cifar10.py --epochs 5 --width_multiplier 2   # quick check
+
+Swap the reference codebook for a Finite Scalar Quantization grid with
+``--bottleneck fsq`` (optionally ``--levels 8 5 5 5``)::
+
+    python examples/train_cifar10.py --bottleneck fsq --levels 8 5 5 5
 """
 from __future__ import annotations
 
@@ -116,6 +121,12 @@ def main():
     ap.add_argument("--dab_tau", type=float, default=1.0)
     ap.add_argument("--dab_dim", type=int, default=8)
     ap.add_argument("--codebook_size", type=int, default=10)
+    ap.add_argument("--bottleneck", default="full", choices=("full", "diag", "fsq"),
+                    help="codebook: 'full'/'diag' are the reference DAB codebook, "
+                         "'fsq' is the Finite Scalar Quantization product grid")
+    ap.add_argument("--levels", type=int, nargs="*", default=None,
+                    help="--bottleneck fsq only: values per coordinate "
+                         "(default: 5 per coordinate)")
     ap.add_argument("--depth", type=int, default=28)
     ap.add_argument("--width_multiplier", type=int, default=10)
     ap.add_argument("--workers", type=int, default=8)
@@ -135,7 +146,9 @@ def main():
                             width_multiplier=args.width_multiplier,
                             num_classes=10, dab_dim=args.dab_dim,
                             codebook_size=args.codebook_size,
-                            dab_tau=args.dab_tau).to(device)
+                            dab_tau=args.dab_tau,
+                            bottleneck=args.bottleneck,
+                            levels=args.levels).to(device)
     print(model.dab)
 
     # The reference code scales the learning rate and the decay epochs linearly
@@ -176,7 +189,9 @@ def main():
             correct += int((logits.argmax(-1) == y).sum())
             seen += y.numel()
 
-        # ---- phase 2: train the codebook (RDFC) ---------------------------
+        # ---- phase 2: fit the codebook (RDFC) -----------------------------
+        # codebook_optimizer is None for an FSQ grid -- it has no trainable
+        # parameters, but the closed-form covariance/prior M-steps still run.
         rdfc_loss = rdfc_epoch(model, codebook_optimizer,
                                lambda: iter(train_loader), distortion)
 

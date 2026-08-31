@@ -21,10 +21,22 @@ Quick start::
     out    = layer(features)          # -> DABOutput
     logits = head(out.latent)
     score  = out.distance             # per-example uncertainty
+
+Or with a Finite Scalar Quantization codebook instead of explicit centroids::
+
+    from dab import FSQDAB, recommended_levels
+
+    layer = FSQDAB(in_features=640, levels=recommended_levels(1024))
+    out   = layer(features)
+    out.latent, out.distance, out.indices    # + discrete codebook tokens
 """
+from .factory import BOTTLENECKS, build_bottleneck
+from .fsq import FSQ, recommended_levels, round_ste
+from .fsq_dab import FSQDAB
 from .functional import (fill_triangular, kl_normal_diag, kl_normal_full,
                          symmetrized_fill_triangular)
-from .layers import DABOutput, NormalDiagCovarianceDAB, NormalFullCovarianceDAB
+from .layers import (DABLayer, DABOutput, NormalDiagCovarianceDAB,
+                     NormalFullCovarianceDAB)
 from .objectives import codebook_distortion, dab_loss
 from .trainer import (WarmUpPiecewiseConstantSchedule, build_optimizers,
                       codebook_parameters, find_dab_layers, network_parameters,
@@ -33,7 +45,9 @@ from .trainer import (WarmUpPiecewiseConstantSchedule, build_optimizers,
 __version__ = "1.0.0"
 
 __all__ = [
-    "NormalDiagCovarianceDAB", "NormalFullCovarianceDAB", "DABOutput",
+    "NormalDiagCovarianceDAB", "NormalFullCovarianceDAB", "FSQDAB",
+    "DABOutput", "DABLayer", "FSQ", "round_ste", "recommended_levels",
+    "build_bottleneck", "BOTTLENECKS",
     "codebook_distortion", "dab_loss",
     "rdfc_epoch", "codebook_parameters", "network_parameters",
     "find_dab_layers", "build_optimizers", "WarmUpPiecewiseConstantSchedule",

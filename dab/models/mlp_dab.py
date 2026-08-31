@@ -19,7 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..layers import DABOutput, NormalFullCovarianceDAB
+from ..factory import build_bottleneck
+from ..layers import DABOutput
 
 
 class MLPDAB(nn.Module):
@@ -36,12 +37,15 @@ class MLPDAB(nn.Module):
       dab_activation: non-linearity applied inside the DAB layer before its
         dense encoder. ``None`` in the demo, because the preceding hidden layer
         is already activated.
+      bottleneck: ``"full"`` (default), ``"diag"`` or ``"fsq"``.
+      levels: ``bottleneck="fsq"`` only -- values per coordinate.
     """
 
     def __init__(self, in_features: int = 1, out_features: int = 1,
                  hidden: int = 100, num_hidden: int = 2, dab_dim: int = 8,
                  codebook_size: int = 1, dab_tau: float = 5.0,
                  momentum: float = 0.0, dab_activation=None,
+                 bottleneck: str = "full", levels=None,
                  generator: Optional[torch.Generator] = None, **dab_kwargs):
         super().__init__()
         layers, width = [], in_features
@@ -49,11 +53,12 @@ class MLPDAB(nn.Module):
             layers += [nn.Linear(width, hidden), nn.ELU()]
             width = hidden
         self.body = nn.Sequential(*layers)
-        self.dab = NormalFullCovarianceDAB(
-            in_features=width, dab_dim=dab_dim, codebook_size=codebook_size,
-            dab_tau=dab_tau, momentum=momentum, activation=dab_activation,
+        self.dab = build_bottleneck(
+            bottleneck, in_features=width, dab_dim=dab_dim,
+            codebook_size=codebook_size, levels=levels, dab_tau=dab_tau,
+            momentum=momentum, activation=dab_activation,
             generator=generator, **dab_kwargs)
-        self.decoder = nn.Linear(dab_dim, out_features)
+        self.decoder = nn.Linear(self.dab.dab_dim, out_features)
 
     def forward(self, x: torch.Tensor, training: Optional[bool] = None
                 ) -> Tuple[torch.Tensor, DABOutput]:

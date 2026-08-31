@@ -36,7 +36,7 @@ from typing import Callable, Iterable, List, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from .layers import _NormalDAB
+from .layers import DABLayer
 
 
 # --------------------------------------------------------------------------- #
@@ -59,9 +59,13 @@ def network_parameters(module: nn.Module) -> List[nn.Parameter]:
             if "centroid" not in n and p.requires_grad]
 
 
-def find_dab_layers(module: nn.Module) -> List[_NormalDAB]:
-    """All DAB layers inside ``module`` (unwraps ``DataParallel``/``DDP``)."""
-    return [m for m in module.modules() if isinstance(m, _NormalDAB)]
+def find_dab_layers(module: nn.Module) -> List[DABLayer]:
+    """All DAB layers inside ``module`` (unwraps ``DataParallel``/``DDP``).
+
+    Finds every codebook flavour -- the reference ``NormalDiagCovarianceDAB`` /
+    ``NormalFullCovarianceDAB`` and the FSQ-grid ``FSQDAB`` alike.
+    """
+    return [m for m in module.modules() if isinstance(m, DABLayer)]
 
 
 def build_optimizers(module: nn.Module, base_learning_rate: float = 0.1,
@@ -74,7 +78,10 @@ def build_optimizers(module: nn.Module, base_learning_rate: float = 0.1,
     * codebook: Adam at ``rdfc_learning_rate``.
 
     Returns ``(optimizer, codebook_optimizer)``. ``codebook_optimizer`` is
-    ``None`` when the module contains no DAB layer.
+    ``None`` when there is nothing to train in the codebook -- either the module
+    has no DAB layer, or it uses an :class:`~dab.fsq_dab.FSQDAB` whose grid is
+    fixed and whose variances are fitted in closed form. ``rdfc_epoch`` accepts
+    ``None`` and still runs both M-step sub-passes.
     """
     net = network_parameters(module)
     code = codebook_parameters(module)
@@ -129,7 +136,10 @@ def rdfc_epoch(dab_layers, codebook_optimizer,
     Args:
       dab_layers: a :class:`~dab.layers._NormalDAB`, a model containing one or
         more of them, or an explicit sequence of them.
-      codebook_optimizer: optimiser over :func:`codebook_parameters`.
+      codebook_optimizer: optimiser over :func:`codebook_parameters`, or
+        ``None`` when the codebook has no trainable parameters (an FSQ grid).
+        Both sub-passes still run: the closed-form covariance and prior M-steps
+        are what fit an FSQ codebook.
       batches: zero-argument callable returning a **fresh** iterable over the
         training data. It is called twice, once per sub-pass.
       distortion_fn: ``batch -> scalar`` -- must run a forward pass of the whole
@@ -154,14 +164,21 @@ def rdfc_epoch(dab_layers, codebook_optimizer,
     for layer in layers:
         layer.reset_codebook_covariance()
     total, n = 0.0, 0
-    params = [p for g in codebook_optimizer.param_groups for p in g["params"]]
+    params = ([p for g in codebook_optimizer.param_groups for p in g["params"]]
+              if codebook_optimizer is not None else [])
     for batch in batches():
-        codebook_optimizer.zero_grad(set_to_none=True)
-        loss = distortion_fn(batch)
-        loss.backward()
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(params, grad_clip)
-        codebook_optimizer.step()
+        if codebook_optimizer is None:
+            # Nothing to descend on (fixed FSQ grid); the forward pass is still
+            # needed so the covariance moving average sees this batch.
+            with torch.no_grad():
+                loss = distortion_fn(batch)
+        else:
+            codebook_optimizer.zero_grad(set_to_none=True)
+            loss = distortion_fn(batch)
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            codebook_optimizer.step()
         total += float(loss.detach())
         n += 1
     for layer in layers:
@@ -180,7 +197,7 @@ def rdfc_epoch(dab_layers, codebook_optimizer,
 
 
 def _as_layers(x) -> List[_NormalDAB]:
-    if isinstance(x, _NormalDAB):
+    if isinstance(x, DABLayer):
         return [x]
     if isinstance(x, nn.Module):
         return find_dab_layers(x)

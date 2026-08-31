@@ -127,3 +127,33 @@ changes the DAB objective.
   `training=True`, including during the encoder/decoder phase. Those updates are
   discarded, because the next RDFC phase resets both averages before
   accumulating. Reproduced as-is.
+
+## 6. The FSQ codebook is an extension, not part of the reference
+
+`dab/fsq.py` and `dab/fsq_dab.py` are **not** ports of anything in the DAB
+repository — the reference implementation has only the two explicit-centroid
+layers documented above. They are provided as an optional alternative codebook
+and are opt-in everywhere (`bottleneck="full"` remains the default).
+
+* `dab/fsq.py` **is** a faithful port, but of a different reference: the JAX
+  implementation in
+  [`google-research/fsq`](https://github.com/google-research/google-research/tree/master/fsq),
+  accompanying Mentzer et al., *Finite Scalar Quantization: VQ-VAE Made Simple*
+  (ICLR 2024, [arXiv:2309.15505](https://arxiv.org/abs/2309.15505)). `bound`,
+  `quantize`, `codes_to_indices`, `indices_to_codes` and `round_ste` follow it
+  line for line, including the even-`L` offset/shift asymmetry and the
+  `/(L//2)` renormalisation. `RECOMMENDED_LEVELS` is Table 1 of the paper, and
+  the tests assert the per-channel value sets it implies.
+
+* `dab/fsq_dab.py` combines the two: DAB's rate–distortion objective, E-step and
+  closed-form M-step, over FSQ's product grid instead of explicit centroids.
+  The combination is not published; treat it as an engineering option, not a
+  reproduction. What *is* provable — and tested against brute-force enumeration
+  in `tests/test_fsq_dab.py` — is that the coordinate-wise distance it computes
+  equals the expected KL over all `prod_j L_j` product codes exactly, because
+  the encoder covariance is diagonal and the prior factorises.
+
+The DAB machinery is shared rather than duplicated: `FSQDAB` derives from the
+same `DABLayer` base as `_NormalDAB`, so `rdfc_epoch`, `codebook_parameters`,
+`find_dab_layers` and the phase protocol are literally the same code for both
+codebooks.

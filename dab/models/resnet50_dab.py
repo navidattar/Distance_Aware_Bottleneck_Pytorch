@@ -19,7 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..layers import DABOutput, NormalDiagCovarianceDAB
+from ..factory import build_bottleneck
+from ..layers import DABOutput
 
 
 class ResNet50DAB(nn.Module):
@@ -35,13 +36,16 @@ class ResNet50DAB(nn.Module):
         trained, matching the reference default.
       pretrained: load torchvision's ImageNet weights.
       hidden: width of the head's hidden layers.
+      bottleneck: ``"diag"`` (the reference ImageNet setting), ``"full"``, or
+        ``"fsq"`` for the Finite Scalar Quantization product grid.
+      levels: ``bottleneck="fsq"`` only -- values per coordinate.
       dab_kwargs: extra keyword arguments forwarded to the DAB layer.
     """
 
     def __init__(self, num_classes: int = 1000, dab_dim: int = 4,
                  codebook_size: int = 1000, dab_tau: float = 2.0,
                  backpropagate: bool = False, pretrained: bool = True,
-                 hidden: int = 2048,
+                 hidden: int = 2048, bottleneck: str = "diag", levels=None,
                  generator: Optional[torch.Generator] = None, **dab_kwargs):
         super().__init__()
         from torchvision.models import ResNet50_Weights, resnet50
@@ -56,10 +60,11 @@ class ResNet50DAB(nn.Module):
         self.fc1 = nn.Linear(2048, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, hidden)
-        self.dab = NormalDiagCovarianceDAB(
-            in_features=hidden, dab_dim=dab_dim, codebook_size=codebook_size,
-            dab_tau=dab_tau, generator=generator, **dab_kwargs)
-        self.decoder = nn.Linear(dab_dim, num_classes)
+        self.dab = build_bottleneck(
+            bottleneck, in_features=hidden, dab_dim=dab_dim,
+            codebook_size=codebook_size, levels=levels, dab_tau=dab_tau,
+            generator=generator, **dab_kwargs)
+        self.decoder = nn.Linear(self.dab.dab_dim, num_classes)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -90,11 +95,12 @@ class ResNet50DAB(nn.Module):
 def pretrained_resnet50_dab(num_classes: int = 1000, dab_dim: int = 4,
                             codebook_size: int = 1000, dab_tau: float = 2.0,
                             backpropagate: bool = False,
-                            **kwargs) -> ResNet50DAB:
+                            bottleneck: str = "diag", **kwargs) -> ResNet50DAB:
     """Functional alias mirroring the reference ``pretrained_resnet50_dab``."""
     return ResNet50DAB(num_classes=num_classes, dab_dim=dab_dim,
                        codebook_size=codebook_size, dab_tau=dab_tau,
-                       backpropagate=backpropagate, **kwargs)
+                       backpropagate=backpropagate, bottleneck=bottleneck,
+                       **kwargs)
 
 
 __all__ = ["ResNet50DAB", "pretrained_resnet50_dab"]

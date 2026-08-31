@@ -157,3 +157,49 @@ The DAB machinery is shared rather than duplicated: `FSQDAB` derives from the
 same `DABLayer` base as `_NormalDAB`, so `rdfc_epoch`, `codebook_parameters`,
 `find_dab_layers` and the phase protocol are literally the same code for both
 codebooks.
+
+## 7. iFSQ
+
+`dab/ifsq.py` implements Lin et al., *iFSQ: Improving FSQ for Image Generation
+with 1 Line of Code* ([arXiv:2601.17124](https://arxiv.org/abs/2601.17124)).
+There is no reference implementation vendored here, so the port follows the
+paper's Algorithm 1 and §3.1–3.2 directly:
+
+* the bound is `2·sigmoid(alpha·z) − 1` with `alpha = 1.6` (§3.2 and the
+  pseudocode's one-line diff);
+* the grid scale is `(L−1)/2` and the renormalisation is `/(L−1)/2`
+  (Algorithm 1, steps 2 and 4);
+* rounding uses the same STE (step 3);
+* the index basis is big-endian, `[L^(d−1), …, L^0]` (step 5). The paper's
+  worked example — digits `(2,2,1,0)` with `L=3` giving index 75 — is asserted
+  in `tests/test_ifsq.py`;
+* levels are restricted to odd `L = 2K+1`, which §3.1 requires for an exact zero
+  centre and which the bound's lack of an even-`L` offset makes mandatory.
+
+`IFSQ` subclasses `FSQ` and overrides only `bound`; `IFSQDAB` subclasses
+`FSQDAB` and only swaps the quantizer. With `alpha=2.0`, `eps=0.0` and
+`index_order="little"` both reduce exactly to their FSQ counterparts, which is
+tested.
+
+### Two findings recorded during the port
+
+Both are checkable in the test suite; neither changes the default behaviour.
+
+1. **The optimal slope is ≈1.70, not 1.6.** The paper sweeps
+   `alpha ∈ {1.0, 1.3, 1.6, 2.0, 2.4}` and reports 1.6 as the best. On a finer
+   sweep the Kolmogorov-Smirnov minimum sits at `alpha ≈ 1.70` (KS 0.011 vs
+   0.017 at 1.6 and 0.046 at `tanh`), which is the classic logistic
+   approximation to the Gaussian CDF, `sigma(1.702x) ≈ Phi(x)`. This *supports*
+   the paper's distribution-matching thesis and refines its constant.
+   `IFSQ_ALPHA_KS_OPTIMAL` exposes it; the default remains the paper's 1.6.
+
+2. **A uniform pre-rounding value does not give a uniform level histogram.**
+   Scaling by `(L−1)/2` makes the two outermost bins half as wide as the
+   interior ones, so a perfectly uniform value on `[-1, 1]` produces
+   `[½, 1, …, 1, ½] / (L−1)`. Measured on an `N(0,1)` latent, vanilla FSQ is
+   therefore *closer* to a uniform histogram than iFSQ at every `L` from 5 to
+   65 — `tanh`'s bimodality happens to compensate for the narrow end bins.
+   The opt-in `edge_bins="equal"` scales by `L/2` instead, equalising the bin
+   widths; at `L=5` it cuts the maximum deviation from 0.089 to 0.008 and
+   reaches 2.321 of the 2.322-bit ceiling. This is our observation, not the
+   paper's, so `"paper"` is the default.

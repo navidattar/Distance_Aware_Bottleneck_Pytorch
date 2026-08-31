@@ -130,6 +130,10 @@ class DABLayer(nn.Module):
         ``"he_normal"`` (what the reference image models pass in).
       var_shift, var_floor: encoder scale parameterisation,
         ``scale = softplus(raw - var_shift) + var_floor``.
+      dirichlet_alpha: strength of the Dirichlet prior that smooths the
+        responsibilities in the codebook-covariance M-step. ``5.0`` is the
+        reference value; see :meth:`_dirichlet_weights` for what it does to the
+        fitted covariances.
       generator: optional ``torch.Generator`` for reproducible initialisation.
     """
 
@@ -145,6 +149,7 @@ class DABLayer(nn.Module):
         kernel_initializer: str = "glorot_uniform",
         var_shift: float = 5.0,
         var_floor: float = 1e-5,
+        dirichlet_alpha: float = 5.0,
         generator: Optional[torch.Generator] = None,
     ):
         super().__init__()
@@ -155,6 +160,7 @@ class DABLayer(nn.Module):
         self.momentum = momentum
         self.var_shift = var_shift
         self.var_floor = var_floor
+        self.dirichlet_alpha = dirichlet_alpha
 
         if callable(activation):
             self.dab_activation = activation
@@ -293,11 +299,24 @@ class DABLayer(nn.Module):
                            n: torch.Tensor) -> torch.Tensor:
         r"""Per-datapoint contribution weights for the codebook covariance.
 
-        ``(a_ik + 5) / (sum_i a_ik + 5N)``: a Dirichlet prior with
-        :math:`a_k = 5` that avoids over-concentration and eases training.
+        ``(a_ik + alpha) / (sum_i a_ik + alpha N)``: a Dirichlet prior that, in
+        the reference implementation's words, avoids over-concentration and
+        eases training. ``alpha = 5`` is the reference value.
+
+        .. note::
+           This smoothing is strong. With ``alpha = 5`` and a batch of ``N``,
+           the denominator is dominated by ``5N`` while the numerator varies
+           only between ``5`` and ``6``, so every code's fitted covariance is
+           pulled towards a *shared* batch covariance and differs from it by at
+           most ~20%. That is the reference behaviour and the default here, but
+           if you want codes whose covariances genuinely specialise, lower
+           ``dirichlet_alpha`` (0.1-1.0). ``0.0`` recovers the unsmoothed
+           maximum-likelihood update, which is exact but undefined for codes
+           that receive no responsibility.
         """
-        return (cond_centroid_probs + 5.0) / (
-            cond_centroid_probs.sum(dim=0, keepdim=True) + 5.0 * n)
+        alpha = self.dirichlet_alpha
+        denom = cond_centroid_probs.sum(dim=0, keepdim=True) + alpha * n
+        return (cond_centroid_probs + alpha) / denom.clamp_min(1e-12)
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
@@ -351,6 +370,7 @@ class _NormalDAB(DABLayer):
         kernel_initializer: str = "glorot_uniform",
         var_shift: float = 5.0,
         var_floor: float = 1e-5,
+        dirichlet_alpha: float = 5.0,
         generator: Optional[torch.Generator] = None,
     ):
         super().__init__(in_features=in_features, units=units, dab_dim=dab_dim,
@@ -358,7 +378,7 @@ class _NormalDAB(DABLayer):
                          activation=activation, use_bias=use_bias,
                          kernel_initializer=kernel_initializer,
                          var_shift=var_shift, var_floor=var_floor,
-                         generator=generator)
+                         dirichlet_alpha=dirichlet_alpha, generator=generator)
         self.codebook_size = codebook_size
 
         # Centroid means -- the only *trainable* codebook parameter. The name
@@ -431,6 +451,7 @@ class NormalDiagCovarianceDAB(_NormalDAB):
                  kernel_initializer: str = "glorot_uniform",
                  var_shift: float = 5.0, var_floor: float = 1e-5,
                  covariance_floor: float = 0.0,
+                 dirichlet_alpha: float = 5.0,
                  generator: Optional[torch.Generator] = None):
         super().__init__(
             in_features=in_features,
@@ -439,7 +460,8 @@ class NormalDiagCovarianceDAB(_NormalDAB):
             dab_dim=dab_dim, codebook_size=codebook_size, dab_tau=dab_tau,
             momentum=momentum, activation=activation, use_bias=use_bias,
             kernel_initializer=kernel_initializer, var_shift=var_shift,
-            var_floor=var_floor, generator=generator)
+            var_floor=var_floor, dirichlet_alpha=dirichlet_alpha,
+            generator=generator)
         self.covariance_floor = covariance_floor
 
         # Moving average supporting the batched RDFC covariance update.
@@ -553,6 +575,7 @@ class NormalFullCovarianceDAB(_NormalDAB):
                  kernel_initializer: str = "glorot_uniform",
                  var_shift: float = 5.0, var_floor: float = 1e-5,
                  codebook_jitter: float = 0.0,
+                 dirichlet_alpha: float = 5.0,
                  generator: Optional[torch.Generator] = None):
         super().__init__(
             in_features=in_features,
@@ -562,7 +585,8 @@ class NormalFullCovarianceDAB(_NormalDAB):
             dab_dim=dab_dim, codebook_size=codebook_size, dab_tau=dab_tau,
             momentum=momentum, activation=activation, use_bias=use_bias,
             kernel_initializer=kernel_initializer, var_shift=var_shift,
-            var_floor=var_floor, generator=generator)
+            var_floor=var_floor, dirichlet_alpha=dirichlet_alpha,
+            generator=generator)
         self.codebook_jitter = codebook_jitter
 
         eye = torch.eye(dab_dim).unsqueeze(0).repeat(codebook_size, 1, 1)

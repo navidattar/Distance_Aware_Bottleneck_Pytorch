@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Optional, Sequence, Union
 
 from .fsq_dab import FSQDAB
+from .ifsq import IFSQDAB
 from .layers import DABLayer, NormalDiagCovarianceDAB, NormalFullCovarianceDAB
 
 #: Codebook kinds accepted by :func:`build_bottleneck`.
@@ -21,6 +22,7 @@ BOTTLENECKS = {
     "full": NormalFullCovarianceDAB,   # reference DAB, full-covariance codes
     "diag": NormalDiagCovarianceDAB,   # reference DAB, diagonal-covariance codes
     "fsq": FSQDAB,                     # FSQ product grid of scalar Gaussians
+    "ifsq": IFSQDAB,                   # ... with iFSQ's distribution-matching bound
 }
 
 
@@ -39,7 +41,9 @@ def build_bottleneck(kind: str, in_features: int,
         * ``"diag"`` -- the reference DAB codebook with diagonal covariances
           (the paper's ImageNet setting);
         * ``"fsq"`` -- a Finite Scalar Quantization product grid; see
-          :class:`~dab.fsq_dab.FSQDAB`.
+          :class:`~dab.fsq_dab.FSQDAB`;
+        * ``"ifsq"`` -- the same grid with iFSQ's distribution-matching bound
+          (odd levels only); see :class:`~dab.ifsq.IFSQDAB`.
 
       in_features: size of the incoming feature vector.
       dab_dim: latent dimension. Required for ``"full"``/``"diag"``. For
@@ -48,9 +52,10 @@ def build_bottleneck(kind: str, in_features: int,
         ``"full"``/``"diag"``, ignored by ``"fsq"`` (whose codebook size is
         ``prod(levels)``; use :func:`dab.fsq.recommended_levels` to match a
         target size).
-      levels: ``"fsq"`` only -- values per coordinate, or a single int applied
-        to every coordinate. Defaults to ``5`` per coordinate, the smallest
-        value the FSQ paper's heuristic allows.
+      levels: ``"fsq"``/``"ifsq"`` only -- values per coordinate, or a single
+        int applied to every coordinate. Defaults to ``5`` per coordinate, the
+        smallest value the FSQ paper's heuristic allows (and odd, so it is also
+        valid for ``"ifsq"``).
       **kwargs: forwarded to the layer (``dab_tau``, ``momentum``,
         ``activation``, and the kind-specific options).
 
@@ -66,17 +71,18 @@ def build_bottleneck(kind: str, in_features: int,
         raise ValueError(
             f"unknown bottleneck {kind!r}; choose from {sorted(BOTTLENECKS)}")
 
-    if kind == "fsq":
+    if kind in ("fsq", "ifsq"):
+        cls = BOTTLENECKS[kind]
         if levels is None:
             if dab_dim is None:
-                raise ValueError("pass `levels` or `dab_dim` for kind='fsq'")
+                raise ValueError(f"pass `levels` or `dab_dim` for kind={kind!r}")
             levels = 5
         if isinstance(levels, int):
             if dab_dim is None:
                 raise ValueError("pass `dab_dim` when `levels` is an int")
-            return FSQDAB(in_features=in_features, levels=levels,
-                          dab_dim=dab_dim, **kwargs)
-        return FSQDAB(in_features=in_features, levels=levels, **kwargs)
+            return cls(in_features=in_features, levels=levels,
+                       dab_dim=dab_dim, **kwargs)
+        return cls(in_features=in_features, levels=levels, **kwargs)
 
     if dab_dim is None or codebook_size is None:
         raise ValueError(f"`dab_dim` and `codebook_size` are required for "

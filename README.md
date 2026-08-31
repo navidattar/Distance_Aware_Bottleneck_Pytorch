@@ -20,14 +20,18 @@ The port is line-by-line auditable against the original: attribute names, buffer
 semantics, update equations and the two-phase training schedule all match. Every
 deviation is listed in [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md).
 
-**Two codebooks, one interface.** Alongside the paper's explicit Gaussian
-centroids, the package ships an optional **Finite Scalar Quantization** codebook
-([Mentzer et al., ICLR 2024](https://arxiv.org/abs/2309.15505)): the codes become
-the Cartesian product of per-coordinate scalar levels, which costs *zero*
-codebook parameters, cannot collapse, and hands you discrete tokens for free.
-Switching is one word — `bottleneck="fsq"` — and everything else (the objective,
-the E-step, the RDFC schedule, the training loop) is unchanged. See
-[Choosing a codebook](#choosing-a-codebook).
+**Three codebooks, one interface.** Alongside the paper's explicit Gaussian
+centroids, the package ships two optional quantized codebooks in which the codes
+become the Cartesian product of per-coordinate scalar levels — *zero* codebook
+parameters, no possibility of collapse, and discrete tokens for free:
+
+- **FSQ** — [Mentzer et al., ICLR 2024](https://arxiv.org/abs/2309.15505);
+- **iFSQ** — [Lin et al., 2026](https://arxiv.org/abs/2601.17124), FSQ with a
+  distribution-matching bound.
+
+Switching is one word — `bottleneck="fsq"` or `"ifsq"` — and everything else
+(the objective, the E-step, the RDFC schedule, the training loop) is unchanged.
+See [Choosing a codebook](#choosing-a-codebook).
 
 ---
 
@@ -38,6 +42,7 @@ the E-step, the RDFC schedule, the training loop) is unchanged. See
 - [How DAB works](#how-dab-works)
 - [Choosing a codebook](#choosing-a-codebook)
 - [The FSQ codebook](#the-fsq-codebook)
+- [The iFSQ codebook](#the-ifsq-codebook)
 - [Adding DAB to your own model](#adding-dab-to-your-own-model)
 - [The training loop](#the-training-loop)
 - [API reference](#api-reference)
@@ -159,15 +164,17 @@ Gaussian codebook, with a Dirichlet(5) smoothing of the responsibilities).
 Both codebooks implement the same DAB objective, the same E-step, and the same
 two-phase schedule. They differ only in *what the codes are*.
 
-|                          | `"full"` / `"diag"` (reference DAB) | `"fsq"` (FSQ grid) |
-| --- | --- | --- |
-| codes | `K` learned Gaussians in `R^d` | `∏ⱼ Lⱼ` implicit product codes |
-| codebook parameters | `K × d` means (+ covariance state) | **none** — the grid is fixed |
-| distance cost / example | `O(K·d²)` full, `O(K·d)` diag | `O(Σⱼ Lⱼ)` |
-| codebook collapse | possible (centroids can die) | impossible by construction |
-| discrete tokens | ✗ | ✓ `out.indices` |
-| far-OOD distance | grows without bound | **saturates** (see the warning below) |
-| faithful to the DAB paper | ✓ | extension |
+|                          | `"full"` / `"diag"` (reference DAB) | `"fsq"` | `"ifsq"` |
+| --- | --- | --- | --- |
+| codes | `K` learned Gaussians in `R^d` | `∏ⱼ Lⱼ` implicit product codes | same |
+| codebook parameters | `K × d` means (+ covariance state) | **none** | **none** |
+| distance cost / example | `O(K·d²)` full, `O(K·d)` diag | `O(Σⱼ Lⱼ)` | `O(Σⱼ Lⱼ)` |
+| codebook collapse | possible (centroids can die) | impossible | impossible |
+| discrete tokens | ✗ | ✓ `out.indices` | ✓ `out.indices` |
+| bounding map | — | `tanh`-based `f` | `2σ(αz) − 1` |
+| even levels | — | ✓ | ✗ (odd only) |
+| far-OOD distance | grows without bound | **saturates** | **saturates** |
+| faithful to the DAB paper | ✓ | extension | extension |
 
 **Use the reference codebook when** you want to reproduce the paper, or when
 ranking far-out-of-distribution inputs is the point. It is the default.
@@ -181,6 +188,7 @@ from dab import build_bottleneck, recommended_levels
 
 build_bottleneck("full", in_features=640, dab_dim=8, codebook_size=10)
 build_bottleneck("fsq",  in_features=640, levels=recommended_levels(1024))
+build_bottleneck("ifsq", in_features=640, levels=[5, 5, 5, 5])
 ```
 
 Every model takes the same switch:
@@ -190,6 +198,7 @@ from dab.models import wide_resnet_dab
 
 wide_resnet_dab(bottleneck="full", dab_dim=8, codebook_size=10)      # default
 wide_resnet_dab(bottleneck="fsq",  levels=[8, 5, 5, 5])
+wide_resnet_dab(bottleneck="ifsq", levels=[5, 5, 5, 5])
 ```
 
 ---
@@ -307,6 +316,115 @@ fsq.indices_to_codes(indices)     # == zhat
 
 It has no parameters, no commitment loss and no EMA — that is the point of the
 paper.
+
+---
+
+## The iFSQ codebook
+
+iFSQ changes exactly one thing about FSQ: the bounding function. Written as a
+sigmoid, FSQ's bound is `tanh(z) = 2σ(2z) − 1` — slope `α = 2`. Push a
+standard-normal latent through it and the output is *bimodal*, piling up near
+the ends of the interval. Sweeping the slope, `α = 1.6` maps a standard normal
+to an approximately **uniform** distribution on `[-1, 1]`:
+
+```diff
+- z = tanh(z)
++ z = 2 * sigmoid(1.6 * z) - 1
+```
+
+Everything downstream — scaling, rounding, the STE, the index arithmetic — is
+unchanged, so `IFSQ` is a drop-in for `FSQ` and `IFSQDAB` for `FSQDAB`:
+
+```python
+from dab import IFSQ, IFSQDAB
+
+quantizer = IFSQ([5, 5, 5, 5])                       # plain iFSQ, 625 codes
+layer = IFSQDAB(in_features=640, levels=[5, 5, 5, 5])   # iFSQ + DAB
+```
+
+### Odd levels only
+
+The paper defines `L = 2K + 1` so an exact zero centre exists, and its bound has
+no even-`L` offset (FSQ's does). With an even `L` the map would round to `L + 1`
+distinct integers, so `IFSQ` rejects even levels with an explanation. Where FSQ
+would use `[8, 5, 5, 5]`, use `[5, 5, 5, 5]` (625 codes) or `[9, 5, 5, 5]` (1125).
+
+### Verified: α = 1.6 does improve uniformity, and ≈1.70 is better still
+
+`uniformity_error(alpha)` reproduces the paper's Figure 2(b) sweep — the KS
+statistic and RMSE between the bounded value's CDF and the uniform CDF:
+
+| α | KS | RMSE |
+| --- | --- | --- |
+| 1.0 | 0.119 | 0.083 |
+| 1.3 | 0.060 | 0.042 |
+| **1.6** (paper) | 0.017 | 0.009 |
+| **1.70** | **0.011** | **0.007** |
+| 2.0 (`tanh`, FSQ) | 0.046 | 0.031 |
+| 2.4 | 0.087 | 0.061 |
+
+The paper's claim holds: 1.6 is ~2.7× closer to uniform than `tanh`. It sweeps a
+coarse grid `{1.0, 1.3, 1.6, 2.0, 2.4}`; refining it puts the minimum at
+`α ≈ 1.70`, which is the classic logistic approximation to the Gaussian CDF,
+`σ(1.702x) ≈ Φ(x)` — exactly what "match the distribution to a uniform"
+predicts, since pushing a variable through its own CDF gives a uniform. The
+default stays at the paper's `1.6`; pass `alpha=IFSQ_ALPHA_KS_OPTIMAL` for the
+refined value.
+
+### Caveat: uniform *value* is not uniform *bin occupancy*
+
+This one is worth understanding before you reach for iFSQ.
+
+Step 2 of the algorithm scales the bounded value by `(L−1)/2` before rounding.
+That makes the two **outermost bins half as wide** as the interior ones, so even
+a perfectly uniform value on `[-1, 1]` yields the histogram
+`[½, 1, 1, …, 1, ½] / (L−1)` — the end bins are under-filled by 2×.
+
+Measuring the marginal level histogram for `z ~ N(0, 1)` (via
+`level_histogram`), vanilla FSQ turns out to be *closer* to uniform than iFSQ at
+every `L` from 5 to 65, because `tanh`'s bimodality happens to pile mass onto
+exactly those half-width end bins. At `L = 5`:
+
+| grid | occupancy | max deviation from ⅕ | realised entropy (max 2.322) |
+| --- | --- | --- | --- |
+| FSQ (`tanh`) | `.166 .234 .201 .234 .164` | 0.036 | 2.304 |
+| iFSQ, paper scaling | `.113 .263 .250 .263 .111` | 0.089 | 2.221 |
+| iFSQ, `edge_bins="equal"` | `.194 .207 .200 .207 .192` | **0.008** | **2.321** |
+
+`α` fixes the pre-rounding distribution; it does not fix the grid. Passing
+`edge_bins="equal"` scales by `L/2` instead, making every bin the same width and
+delivering what the uniformity argument promises — an 11× reduction in
+deviation at `L = 5`, and essentially the entropy ceiling. **This is our
+observation, not the paper's**, so `"paper"` remains the default:
+
+```python
+IFSQ([5, 5, 5, 5], edge_bins="equal")
+IFSQDAB(in_features=640, levels=[5, 5, 5, 5], edge_bins="equal")
+```
+
+It matters most with `hard=True`, where the level histogram *is* the code
+distribution. In soft mode DAB's learned prior absorbs some of the
+non-uniformity by itself.
+
+### Index convention
+
+The paper's pseudocode uses a big-endian basis `[L^(d−1), …, L^0]`, so `IFSQ`
+defaults to `index_order="big"` while `FSQ` keeps the Google reference's
+little-endian `[1, L₀, L₀L₁, …]`. Both are bijections onto `[0, ∏ⱼLⱼ)` — they
+just number the codewords differently, so **tokens are not interchangeable
+between the two**. Pass `index_order` explicitly if you need a specific
+numbering. (`IFSQ([3,3,3,3])` reproduces the paper's worked example: digits
+`(2,2,1,0)` → index 75.)
+
+### Does it help for uncertainty?
+
+Unknown, and this repository has not measured it. iFSQ's argument is about the
+marginal distribution of a *Gaussian* latent, which is what a reconstruction
+autoencoder tends to produce. DAB trains its latent under a rate–distortion
+objective with a learned prior, so the premise does not automatically hold.
+Treat `IFSQDAB` as an option worth A/B-ing against `FSQDAB`, not as a known
+improvement. Setting `ifsq_alpha=2.0, index_order="little", fsq_eps=0.0`
+reproduces `FSQDAB` numerically, which makes a controlled comparison easy.
 
 ---
 
@@ -503,8 +621,27 @@ build_bottleneck(kind, in_features, dab_dim=None, codebook_size=None,
                  levels=None, **kwargs) -> DABLayer
 ```
 
-`kind` is `"full"`, `"diag"` or `"fsq"`. Use it when the codebook should be a
-config option rather than an import.
+`kind` is `"full"`, `"diag"`, `"fsq"` or `"ifsq"`. Use it when the codebook
+should be a config option rather than an import.
+
+### `IFSQ` / `IFSQDAB`
+
+```python
+IFSQ(levels, alpha=1.6, eps=0.0, index_order="big", edge_bins="paper")
+IFSQDAB(in_features, levels=5, dab_dim=None, ifsq_alpha=1.6,
+        fsq_eps=0.0, index_order="big", edge_bins="paper", **FSQDAB_kwargs)
+```
+
+`IFSQ` subclasses `FSQ` and overrides only `bound`; `IFSQDAB` subclasses
+`FSQDAB` and only swaps the quantizer. Everything else is inherited, so the
+contracts above apply unchanged.
+
+| Helper | Purpose |
+| --- | --- |
+| `ifsq_bound(z, alpha)` | `2σ(αz) − 1`; `α=2` is exactly `tanh` |
+| `uniformity_error(alpha)` | KS and RMSE against a uniform — the paper's Fig. 2(b) |
+| `level_histogram(quantizer)` | marginal bin occupancy for an `N(0,1)` latent |
+| `IFSQ_ALPHA` (1.6), `IFSQ_ALPHA_KS_OPTIMAL` (1.702), `TANH_ALPHA` (2.0) | slopes |
 
 ### `DABOutput`
 
@@ -551,6 +688,7 @@ full-covariance layer `centroid_precision`,
 | `kl_normal_diag`, `kl_normal_full`, `fill_triangular` | the underlying tensor primitives |
 | `build_bottleneck(kind, ...)` | build any codebook by name |
 | `recommended_levels(size)` | the FSQ paper's Table 1 level sets |
+| `ifsq_bound`, `uniformity_error`, `level_histogram` | iFSQ's bound and its diagnostics |
 | `round_ste(z)` | rounding with straight-through gradients |
 
 ---
@@ -590,12 +728,22 @@ Practical guidance:
   `O(B·K·d²)` per forward plus a `d×d` SVD per example; diagonal is
   `O(B·K·d)`. Use full for small `d`, diagonal for large `K`.
 
-For the FSQ codebook, `codebook_size` and `dab_dim` are both replaced by
-`levels`: `d = len(levels)` and `|C| = ∏ⱼ Lⱼ`. Start from
+For the FSQ and iFSQ codebooks, `codebook_size` and `dab_dim` are both replaced
+by `levels`: `d = len(levels)` and `|C| = ∏ⱼ Lⱼ`. Start from
 `recommended_levels(K)` for whatever `K` you would have used, keep `Lⱼ ≥ 5`, and
 tune `beta` and `dab_tau` exactly as above — `dab_tau` now sharpens the
 assignment *within each coordinate*, so a value that worked for `K` explicit
-codes is a reasonable starting point.
+codes is a reasonable starting point. iFSQ additionally requires every `Lⱼ` to
+be odd.
+
+One more knob worth knowing about, shared by all three codebooks:
+`dirichlet_alpha` (default `5.0`, the reference value) smooths the
+responsibilities in the covariance M-step. It is strong: with `alpha = 5` and a
+batch of `N`, the weight denominator is dominated by `5N` while the numerator
+only ranges over `[5, 6]`, so every code's fitted covariance is pulled to within
+~20% of a *shared* batch covariance. That is what the reference DAB does and it
+stays the default, but lower it (0.1–1.0) if you want codes whose covariances
+genuinely specialise.
 
 ---
 
@@ -728,6 +876,15 @@ The `tanh` bound has saturated — see
 [the saturation warning](#saturation-read-this-before-using-fsq-for-ood).
 Try `bound=None`, more levels, or the reference codebook.
 
+**iFSQ: `ValueError: iFSQ requires odd levels`.**
+By design — see [Odd levels only](#odd-levels-only). Round up (`8 → 9`) or use
+`bottleneck="fsq"`.
+
+**iFSQ: bin occupancy still looks uneven.**
+Expected with the paper's scaling; see
+[the bin-occupancy caveat](#caveat-uniform-value-is-not-uniform-bin-occupancy).
+Try `edge_bins="equal"`.
+
 **FSQ: `build_optimizers` returned `codebook_optimizer=None`.**
 Expected. The grid is fixed and the variances are fitted in closed form, so
 there is nothing to descend on. `rdfc_epoch(model, None, ...)` still runs both
@@ -748,7 +905,7 @@ pip install pytest
 pytest tests/ -q
 ```
 
-135 tests.
+180 tests.
 
 *DAB core:* `fill_triangular` against the tfp docstring values, both KL
 divergences against `torch.distributions`, the encoder parameterisation, the
@@ -768,6 +925,12 @@ full product codebook (several level sets × temperatures), assignment
 factorisation, ragged-level masking, hard-mode one-hot assignment and codeword
 latents, the closed-form variance M-step, RDFC without a codebook optimiser, and
 the saturation diagnostic.
+
+*iFSQ:* `2σ(2z)−1 == tanh(z)` exactly, the uniformity sweep and its minimum near
+1.70, `α=2` reproducing plain FSQ, odd-level enforcement, the paper's worked
+index example, the half-width end-bin effect at four values of `L`, and
+`edge_bins="equal"` restoring a uniform histogram (including `L=7`, where
+round-half-to-even would otherwise overflow the range).
 
 ---
 
@@ -795,6 +958,19 @@ If you use the FSQ codebook, please also cite:
 }
 ```
 
+And if you use the iFSQ codebook:
+
+```bibtex
+@article{lin2026ifsq,
+  title   = {{iFSQ}: Improving {FSQ} for Image Generation with 1 Line of Code},
+  author  = {Lin, Bin and Li, Zongjian and Niu, Yuwei and Gong, Kaixiong and
+             Ge, Yunyang and Lin, Yunlong and Zheng, Mingzhe and Zhang, JianWei
+             and Yang, Miles and Zhong, Zhao and Bo, Liefeng and Yuan, Li},
+  journal = {arXiv preprint arXiv:2601.17124},
+  year    = {2026}
+}
+```
+
 Apache License 2.0, matching the original repository. The original TensorFlow
 implementation is © 2024 Ifigeneia Apostolopoulou; this port keeps that notice
 in every ported file. `dab/fsq.py` is a port of the JAX implementation in
@@ -802,6 +978,7 @@ in every ported file. `dab/fsq.py` is a port of the JAX implementation in
 © 2023 The Google Research Authors. The WideResNet backbone follows
 [Uncertainty Baselines](https://github.com/google/uncertainty-baselines/).
 
-`FSQDAB` — DAB's objective over an FSQ grid — is an engineering extension, not
-something either paper proposes; it is documented as such in
-[`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) §6 and is never the default.
+`FSQDAB` and `IFSQDAB` — DAB's objective over an FSQ or iFSQ grid — are
+engineering extensions, not something any of these papers proposes; they are
+documented as such in [`docs/FAITHFULNESS.md`](docs/FAITHFULNESS.md) §6–7 and
+are never the default. So is `edge_bins="equal"`.

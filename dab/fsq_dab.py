@@ -101,8 +101,22 @@ class FSQDAB(DABLayer):
         ``code_scale_init``.
       code_scale_init: initial per-level standard deviation. ``None`` (default)
         uses half the grid spacing of each coordinate.
-      activation, use_bias, kernel_initializer, var_shift, var_floor, generator:
-        as in :class:`~dab.layers.DABLayer`.
+      fsq_eps: passed to the quantizer's bounding function.
+      quantizer: an already-built :class:`~dab.fsq.FSQ` (or subclass) to use
+        instead of constructing one. This is how :class:`~dab.ifsq.IFSQDAB`
+        swaps in the iFSQ bounding map; you can also pass a plain ``FSQ`` with a
+        non-default ``index_order``.
+      activation, use_bias, kernel_initializer, var_shift, var_floor,
+      dirichlet_alpha, generator: as in :class:`~dab.layers.DABLayer`.
+
+    .. note::
+       ``var_shift`` defaults to the reference DAB value of ``5.0``, which
+       starts the encoder standard deviation near ``0.007``. The grid here is
+       normalised to ``[-1, 1]``, where the spacing is ``1 / (L // 2)``, so that
+       initial noise is very small relative to the grid and the early distance
+       is dominated by the log-determinant term. This is harmless -- the scale
+       is learned -- but lower ``var_shift`` if you want the encoder to start
+       closer to the grid resolution.
 
     Shape:
       input ``[B, in_features]`` -> :class:`~dab.layers.DABOutput` with
@@ -124,12 +138,15 @@ class FSQDAB(DABLayer):
                  hard: bool = False, bound: Optional[str] = "fsq",
                  code_scale_mode: str = "ema",
                  code_scale_init: Optional[float] = None,
-                 fsq_eps: float = 1e-3,
+                 fsq_eps: float = 1e-3, quantizer: Optional[FSQ] = None,
                  activation: Union[str, Callable, None] = "relu",
                  use_bias: bool = False,
                  kernel_initializer: str = "glorot_uniform",
                  var_shift: float = 5.0, var_floor: float = 1e-5,
+                 dirichlet_alpha: float = 5.0,
                  generator: Optional[torch.Generator] = None):
+        if quantizer is not None:
+            levels = quantizer.levels
         if isinstance(levels, int):
             if dab_dim is None:
                 raise ValueError("pass `dab_dim` when `levels` is an int")
@@ -149,16 +166,17 @@ class FSQDAB(DABLayer):
                          activation=activation, use_bias=use_bias,
                          kernel_initializer=kernel_initializer,
                          var_shift=var_shift, var_floor=var_floor,
-                         generator=generator)
+                         dirichlet_alpha=dirichlet_alpha, generator=generator)
         self.levels = levels
         self.Lmax = max(levels)
         self.hard = hard
         self.bound_mode = bound
         self.code_scale_mode = code_scale_mode
 
-        # The FSQ grid itself. Kept as a submodule so `bound`, `quantize` and the
-        # index arithmetic stay in one place and match the reference exactly.
-        self.fsq = FSQ(levels, eps=fsq_eps)
+        # The grid itself. Kept as a submodule so the bounding function, the
+        # rounding and the index arithmetic stay in one place and match their
+        # reference implementation exactly.
+        self.fsq = quantizer if quantizer is not None else FSQ(levels, eps=fsq_eps)
 
         # Valid-level mask for ragged grids ([8, 6, 5] etc.): [d, Lmax]
         mask = torch.zeros(d, self.Lmax, dtype=torch.bool)
@@ -172,8 +190,9 @@ class FSQDAB(DABLayer):
             means[j, :levels[j]] = chan
         self.register_buffer("centroid_means", means)
 
-        # Per-coordinate grid spacing, used for the default code scale.
-        spacing = torch.tensor([1.0 / (L // 2) for L in levels])
+        # Per-coordinate grid spacing (in normalised space), used for the
+        # default code scale.
+        spacing = 1.0 / self.fsq.half_width
         self.register_buffer("grid_spacing", spacing)
         if code_scale_init is None:
             init_std = 0.5 * spacing.unsqueeze(-1).expand(d, self.Lmax).clone()
@@ -226,30 +245,14 @@ class FSQDAB(DABLayer):
 
     # ------------------------------------------------------------------ #
     def _bound(self, mu_raw: torch.Tensor) -> torch.Tensor:
-        """Encoder mean in normalised grid space (``[-1, 1]`` for ``bound='fsq'``)."""
+        """Encoder mean in normalised grid space (``[-1, 1]`` for ``bound='fsq'``).
+
+        Delegates to the quantizer, so a subclass that changes the bounding map
+        (:class:`~dab.ifsq.IFSQDAB`) is picked up automatically.
+        """
         if self.bound_mode is None:
             return mu_raw
-        return self.fsq.bound(mu_raw) / self.fsq._half_width
-
-    def _quantize(self, v: torch.Tensor) -> torch.Tensor:
-        """Round ``v`` (normalised grid space) to the grid, straight-through.
-
-        Clamped to the valid level range because ``v`` may carry encoder noise
-        that pushes it past the bounded interval.
-        """
-        hw = self.fsq._half_width
-        lo = -(self.fsq._levels // 2)
-        hi = self.fsq._levels - 1 - (self.fsq._levels // 2)
-        q = torch.clamp(torch.round(v * hw), lo, hi) / hw
-        return v + (q - v).detach()                      # straight-through
-
-    def _level_index(self, v: torch.Tensor) -> torch.Tensor:
-        """Nearest level index in ``[0, L_j)`` for normalised values ``[..., d]``."""
-        hw = self.fsq._half_width
-        lo = -(self.fsq._levels // 2)
-        hi = self.fsq._levels - 1 - (self.fsq._levels // 2)
-        return (torch.clamp(torch.round(v * hw), lo, hi)
-                - lo).long()
+        return self.fsq.bound_normalized(mu_raw)
 
     # ------------------------------------------------------------------ #
     def forward(self, inputs: torch.Tensor,
@@ -276,12 +279,15 @@ class FSQDAB(DABLayer):
         mask = self.level_mask.unsqueeze(0)
         distances = distances.masked_fill(~mask, 0.0)
 
-        assignment = self._e_step(distances, mask)          # [B, d, Lmax]
-
         if self.hard:
-            # FSQ semantics: one-hot nearest level, distortion to that code only.
-            per_coord_idx = self._level_index(mu)           # [B, d]
-            assignment = F.one_hot(per_coord_idx, self.Lmax).to(distances.dtype)
+            # FSQ semantics: the assignment is deterministic nearest-level
+            # rounding, so there is no Gibbs posterior and no `initialized`
+            # bootstrap -- the distortion is the KL to that one code.
+            idx = self.fsq.normalized_to_index(mu)          # [B, d]
+            assignment = F.one_hot(idx, self.Lmax).to(distances.dtype)
+        else:
+            assignment = self._e_step(distances, mask)      # [B, d, Lmax]
+            idx = self.fsq.normalized_to_index(mu.detach())
         distance = (assignment * distances).sum(dim=(-2, -1))   # [B]
 
         # M-step: accumulate the moving averages.
@@ -293,12 +299,11 @@ class FSQDAB(DABLayer):
         # the head the quantized codeword, as FSQ does.
         if training:
             noisy = mu + scale * torch.randn_like(mu)
-            latent = self._quantize(noisy) if self.hard else noisy
+            latent = self.fsq.quantize_normalized(noisy) if self.hard else noisy
         else:
-            latent = self._quantize(mu) if self.hard else mu
+            latent = self.fsq.quantize_normalized(mu) if self.hard else mu
 
         with torch.no_grad():
-            idx = self._level_index(mu)                     # [B, d]
             codes = self.centroid_means.unsqueeze(0).expand(
                 idx.shape[0], -1, -1).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
             indices = self.fsq.codes_to_indices(codes)      # [B]
@@ -371,14 +376,17 @@ class FSQDAB(DABLayer):
         unused = ((occ < 1e-4) & self.level_mask).sum() / valid
         # Coordinates pinned to the outermost level: FSQ's tanh has saturated
         # there, so the distance can no longer grow with distance from the data.
-        edge = (idx == 0) | (idx == (self.fsq._levels.long() - 1))
+        lo, hi = self.fsq.level_bounds()
+        edge = (idx == 0) | (idx == (hi - lo).long())
         return {
             "level_occupancy": occ,
             "level_entropy_mean": entropy.mean(),
             "level_perplexity_mean": entropy.exp().mean(),
             "unused_level_frac": unused.to(occ.dtype),
             "saturated_frac": edge.to(occ.dtype).mean(),
-            "codebook_index_entropy": entropy.sum(),
+            # Sum of the per-coordinate entropies: the entropy of the product of
+            # the marginals, i.e. an upper bound on the joint code entropy.
+            "product_code_entropy": entropy.sum(),
         }
 
     def extra_repr(self) -> str:

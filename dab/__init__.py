@@ -33,6 +33,8 @@ Or with a Finite Scalar Quantization codebook instead of explicit centroids::
 from .factory import BOTTLENECKS, build_bottleneck
 from .fsq import FSQ, recommended_levels, round_ste
 from .fsq_dab import FSQDAB
+from .ifsq import (IFSQ, IFSQ_ALPHA, IFSQ_ALPHA_KS_OPTIMAL, IFSQDAB,
+                   ifsq_bound, level_histogram, uniformity_error)
 from .functional import (fill_triangular, kl_normal_diag, kl_normal_full,
                          symmetrized_fill_triangular)
 from .layers import (DABLayer, DABOutput, NormalDiagCovarianceDAB,
@@ -45,7 +47,10 @@ from .trainer import (WarmUpPiecewiseConstantSchedule, build_optimizers,
 __version__ = "1.0.0"
 
 __all__ = [
-    "NormalDiagCovarianceDAB", "NormalFullCovarianceDAB", "FSQDAB",
+    "NormalDiagCovarianceDAB", "NormalFullCovarianceDAB", "FSQDAB", "IFSQDAB",
+    "IFSQ", "ifsq_bound", "uniformity_error", "level_histogram",
+    "IFSQ_ALPHA",
+    "IFSQ_ALPHA_KS_OPTIMAL",
     "DABOutput", "DABLayer", "FSQ", "round_ste", "recommended_levels",
     "build_bottleneck", "BOTTLENECKS",
     "codebook_distortion", "dab_loss",

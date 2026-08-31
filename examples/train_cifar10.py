@@ -16,9 +16,11 @@ Usage::
     python examples/train_cifar10.py --epochs 5 --width_multiplier 2   # quick check
 
 Swap the reference codebook for a Finite Scalar Quantization grid with
-``--bottleneck fsq`` (optionally ``--levels 8 5 5 5``)::
+``--bottleneck fsq`` (optionally ``--levels 8 5 5 5``), or for iFSQ's
+distribution-matching variant with ``--bottleneck ifsq`` (odd levels only)::
 
-    python examples/train_cifar10.py --bottleneck fsq --levels 8 5 5 5
+    python examples/train_cifar10.py --bottleneck fsq  --levels 8 5 5 5
+    python examples/train_cifar10.py --bottleneck ifsq --levels 5 5 5 5
 """
 from __future__ import annotations
 
@@ -121,12 +123,14 @@ def main():
     ap.add_argument("--dab_tau", type=float, default=1.0)
     ap.add_argument("--dab_dim", type=int, default=8)
     ap.add_argument("--codebook_size", type=int, default=10)
-    ap.add_argument("--bottleneck", default="full", choices=("full", "diag", "fsq"),
+    ap.add_argument("--bottleneck", default="full",
+                    choices=("full", "diag", "fsq", "ifsq"),
                     help="codebook: 'full'/'diag' are the reference DAB codebook, "
-                         "'fsq' is the Finite Scalar Quantization product grid")
+                         "'fsq' is the Finite Scalar Quantization product grid, "
+                         "'ifsq' is FSQ with the distribution-matching bound")
     ap.add_argument("--levels", type=int, nargs="*", default=None,
-                    help="--bottleneck fsq only: values per coordinate "
-                         "(default: 5 per coordinate)")
+                    help="--bottleneck fsq/ifsq only: values per coordinate "
+                         "(default: 5 per coordinate; ifsq needs odd values)")
     ap.add_argument("--depth", type=int, default=28)
     ap.add_argument("--width_multiplier", type=int, default=10)
     ap.add_argument("--workers", type=int, default=8)

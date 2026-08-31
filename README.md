@@ -905,7 +905,7 @@ pip install pytest
 pytest tests/ -q
 ```
 
-180 tests.
+220 tests.
 
 *DAB core:* `fill_triangular` against the tfp docstring values, both KL
 divergences against `torch.distributions`, the encoder parameterisation, the
@@ -915,10 +915,14 @@ formulas, the RDFC phase ordering (including that the priors are estimated with
 the committed covariance), the parameter split, full-covariance sampling against
 its empirical covariance, `state_dict` round-trips, and the LR schedule.
 
-*FSQ:* every channel taking exactly `L` values for extreme inputs, the
-renormalised grid, the even-`L` asymmetry, `f(0)` landing mid-grid, index
-round-trips, codebook enumeration against `itertools.product`, STE gradients,
-Table 1, and codebook utilisation above 90%.
+*FSQ:* a **numerical parity suite** — `tests/test_fsq_reference_parity.py`
+carries a verbatim NumPy transcription of the reference JAX quantizer and
+asserts that `bound`, `quantize`, the codebook and the saturating extremes agree
+to float32 epsilon, with integer indices identical, across eight level sets
+(odd, even, ragged, mixed). Plus: every channel taking exactly `L` values for
+extreme inputs, the renormalised grid, the even-`L` asymmetry, `f(0)` landing
+mid-grid, index round-trips, codebook enumeration against `itertools.product`,
+STE gradients, Table 1, and codebook utilisation above 90%.
 
 *FSQ-DAB:* the factorization identity against brute-force enumeration over the
 full product codebook (several level sets × temperatures), assignment

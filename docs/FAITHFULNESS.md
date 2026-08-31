@@ -203,3 +203,21 @@ Both are checkable in the test suite; neither changes the default behaviour.
    widths; at `L=5` it cuts the maximum deviation from 0.089 to 0.008 and
    reaches 2.321 of the 2.322-bit ceiling. This is our observation, not the
    paper's, so `"paper"` is the default.
+
+## 8. FSQ parity is machine-checked
+
+`tests/test_fsq_reference_parity.py` carries a verbatim NumPy transcription of
+the quantizer in `google-research/fsq/fsq.ipynb` and asserts, across eight level
+sets covering odd, even, ragged and mixed grids:
+
+| Quantity | Tolerance | Result |
+| --- | --- | --- |
+| `bound(z)` | 1e-5 | max Δ 3.3e-7 |
+| `quantize(z)` | 1e-6 | max Δ 2.0e-8 |
+| `codes_to_indices` | exact integers | identical |
+| the full codebook | 1e-6 | max Δ 2.0e-8 |
+| saturating inputs (±1e6) | 1e-6 | identical bins |
+
+So the FSQ core is not merely "written from the paper" — it reproduces the
+reference implementation's arithmetic. Anything that drifts in either direction
+breaks these tests.

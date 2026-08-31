@@ -1,0 +1,15 @@
+Distance-Aware Bottleneck - PyTorch
+Copyright 2026 the PyTorch port authors
+
+This product is a PyTorch port of the reference TensorFlow implementation of
+"A Rate-Distortion View of Uncertainty Quantification" (ICML 2024):
+
+    https://github.com/ifiaposto/Distance_Aware_Bottleneck
+    Copyright 2024 Ifigeneia Apostolopoulou
+    Licensed under the Apache License, Version 2.0
+
+The WideResNet backbone follows Google's Uncertainty Baselines:
+
+    https://github.com/google/uncertainty-baselines/
+    Copyright 2024 The Uncertainty Baselines Authors
+    Licensed under the Apache License, Version 2.0

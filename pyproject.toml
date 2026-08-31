@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dab-pytorch"
+version = "1.0.0"
+description = "Distance-Aware Bottleneck (ICML 2024) - faithful PyTorch implementation"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+dependencies = ["torch>=1.13"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+examples = ["torchvision", "matplotlib", "numpy"]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/navidattar/Distance_Aware_Bottleneck_Pytorch"
+Paper = "https://arxiv.org/abs/2406.10775"
+Reference = "https://github.com/ifiaposto/Distance_Aware_Bottleneck"
+
+[tool.setuptools.packages.find]
+include = ["dab*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
